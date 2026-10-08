@@ -89,6 +89,15 @@ impl PdfText {
     }
 }
 
+/// A page's text, read character by character. PDFium's own `all()` only returns text inside
+/// a rectangle anchored at the page's origin, so a page with a rotation or an offset crop box
+/// comes back empty or missing its top lines.
+fn page_text(page: &pdfium_render::prelude::PdfPage) -> String {
+    page.text()
+        .map(|t| t.chars().iter().filter_map(|c| c.unicode_char()).collect())
+        .unwrap_or_default()
+}
+
 /// Extract the text layer from PDF bytes.
 pub fn extract_text(pdfium: &Pdfium, bytes: &[u8]) -> Result<PdfText> {
     let document = pdfium.load_pdf_from_byte_slice(bytes, None)?;
@@ -98,7 +107,7 @@ pub fn extract_text(pdfium: &Pdfium, bytes: &[u8]) -> Result<PdfText> {
         // One unreadable page must not discard the whole document's text (the `?` here made a
         // PDF with a single bad page index as nothing at all, with no warning). The page keeps
         // its slot as empty text so page numbers still line up.
-        pages.push(page.text().map(|t| t.all()).unwrap_or_default());
+        pages.push(page_text(&page));
     }
     Ok(PdfText { page_count, pages })
 }
@@ -320,74 +329,195 @@ struct Line {
     chars: Vec<(f32, f32, String)>,
 }
 
-/// Every character on `index` whose bounds overlap the rectangle, grouped into lines. Shared
-/// by `select_text_in_rect` (rectangle-bounded) and `select_text_range` (reading-order,
-/// line-aware) — both start from the same raw character gather.
+/// A page's visible box and its own `/Rotate`: maps PDF user space (where PDFium reports
+/// character boxes and where every stored quadpoint lives) to the page as displayed — origin
+/// at the lower-left of what the reader sees, y up, text running left to right on an upright
+/// page. Selection has to reason about lines in this frame: on a page rotated a quarter turn
+/// the "lines" a reader sees are vertical strips in user space.
+#[derive(Clone, Copy)]
+struct Frame {
+    left: f32,
+    bottom: f32,
+    right: f32,
+    top: f32,
+    rotation: u16,
+}
+
+impl Frame {
+    fn of(page: &pdfium_render::prelude::PdfPage) -> Frame {
+        use pdfium_render::prelude::PdfPageRenderRotation as R;
+        let rotation = match page.rotation().unwrap_or(R::None) {
+            R::None => 0,
+            R::Degrees90 => 90,
+            R::Degrees180 => 180,
+            R::Degrees270 => 270,
+        };
+        match page.boundaries().bounding() {
+            Ok(b) => Frame {
+                left: b.bounds.left().value,
+                bottom: b.bounds.bottom().value,
+                right: b.bounds.right().value,
+                top: b.bounds.top().value,
+                rotation,
+            },
+            Err(_) => Frame {
+                left: 0.0,
+                bottom: 0.0,
+                right: page.width().value,
+                top: page.height().value,
+                rotation,
+            },
+        }
+    }
+
+    fn display_point(&self, x: f32, y: f32) -> (f32, f32) {
+        match self.rotation {
+            90 => (y - self.bottom, self.right - x),
+            180 => (self.right - x, self.top - y),
+            270 => (self.top - y, x - self.left),
+            _ => (x - self.left, y - self.bottom),
+        }
+    }
+
+    fn page_point(&self, x: f32, y: f32) -> (f32, f32) {
+        match self.rotation {
+            90 => (self.right - y, x + self.bottom),
+            180 => (self.right - x, self.top - y),
+            270 => (y + self.left, self.top - x),
+            _ => (x + self.left, y + self.bottom),
+        }
+    }
+
+    /// A user-space box as `(left, bottom, right, top)` in the display frame.
+    fn display_rect(&self, l: f32, b: f32, r: f32, t: f32) -> (f32, f32, f32, f32) {
+        let (x0, y0) = self.display_point(l, b);
+        let (x1, y1) = self.display_point(r, t);
+        (x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1))
+    }
+
+    fn page_rect(&self, l: f32, b: f32, r: f32, t: f32) -> (f32, f32, f32, f32) {
+        let (x0, y0) = self.page_point(l, b);
+        let (x1, y1) = self.page_point(r, t);
+        (x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1))
+    }
+}
+
+/// Every character on `index` that falls in the rectangle (display frame), grouped into
+/// lines. Shared by `select_text_in_rect` (rectangle-bounded) and `select_text_range`
+/// (reading-order, line-aware) — both start from the same raw character gather.
+///
+/// A character joins on its glyph ink overlapping the rectangle's vertical band. Ink alone
+/// misses marks that sit above or below the pointer's height — a full stop on the baseline
+/// when the drag ran through the middle of the letters, an apostrophe near the cap line — so
+/// once the lines are known, any other character whose box is centred inside one of them
+/// (and within the horizontal range) is added too. Lines are returned, and character bounds
+/// kept, in display coordinates.
 fn gather_lines(
-    pdfium: &Pdfium,
-    bytes: &[u8],
-    index: u16,
+    frame: &Frame,
+    page: &pdfium_render::prelude::PdfPage,
     left: f32,
     bottom: f32,
     right: f32,
     top: f32,
 ) -> Result<Vec<Line>> {
-    let document = pdfium.load_pdf_from_byte_slice(bytes, None)?;
-    let page = document.pages().get(index)?;
     let text = page.text()?;
 
     let (left, right) = (left.min(right), left.max(right));
     let (bottom, top) = (bottom.min(top), bottom.max(top));
 
-    // One entry per selected character: its bounds and its own string (usually one grapheme).
-    let mut hits: Vec<(PdfRect, String)> = Vec::new();
+    struct Ch {
+        ink: (f32, f32, f32, f32),
+        centre_y: f32,
+        text: String,
+    }
+    let to_tuple = |r: &PdfRect| {
+        frame.display_rect(
+            r.left().value,
+            r.bottom().value,
+            r.right().value,
+            r.top().value,
+        )
+    };
+    let mut chars: Vec<Ch> = Vec::new();
     for c in text.chars().iter() {
-        let Ok(bounds) = c.tight_bounds().or_else(|_| c.loose_bounds()) else {
+        let tight = c.tight_bounds().ok();
+        let loose = c.loose_bounds().ok();
+        let Some(ink) = tight.as_ref().or(loose.as_ref()).map(to_tuple) else {
             continue;
         };
-        let overlaps = bounds.left().value < right
-            && bounds.right().value > left
-            && bounds.bottom().value < top
-            && bounds.top().value > bottom;
-        if overlaps {
-            hits.push((bounds, c.unicode_string().unwrap_or_default()));
-        }
+        let centre_y = loose
+            .as_ref()
+            .or(tight.as_ref())
+            .map(|r| {
+                let b = to_tuple(r);
+                (b.1 + b.3) / 2.0
+            })
+            .unwrap_or((ink.1 + ink.3) / 2.0);
+        chars.push(Ch {
+            ink,
+            centre_y,
+            text: c.unicode_string().unwrap_or_default(),
+        });
     }
 
-    // Group consecutive hits into lines: a new hit starts a new line whenever its vertical
-    // range no longer overlaps the current line's accumulated range.
-    let mut lines: Vec<Line> = Vec::new();
-    for (bounds, ch) in hits {
-        let (l, r, b, t) = (
-            bounds.left().value,
-            bounds.right().value,
-            bounds.bottom().value,
-            bounds.top().value,
-        );
-        let starts_new_line = match lines.last() {
-            Some(line) => b >= line.top || t <= line.bottom,
-            None => true,
-        };
-        if starts_new_line {
-            lines.push(Line {
-                left: l,
-                right: r,
-                bottom: b,
-                top: t,
-                text: ch.clone(),
-                chars: vec![(l, r, ch)],
-            });
-        } else {
-            let line = lines.last_mut().expect("just checked non-empty");
-            line.left = line.left.min(l);
-            line.right = line.right.max(r);
-            line.bottom = line.bottom.min(b);
-            line.top = line.top.max(t);
-            line.text.push_str(&ch);
-            line.chars.push((l, r, ch));
+    let overlaps =
+        |b: &(f32, f32, f32, f32)| b.0 < right && b.2 > left && b.1 < top && b.3 > bottom;
+    let group = |members: &[&Ch]| -> Vec<Line> {
+        let mut lines: Vec<Line> = Vec::new();
+        for c in members {
+            let (l, b, r, t) = c.ink;
+            // PDFium reports a generated space as a zero-size box that, on rotated text, can sit
+            // just outside its line; a space belongs to the line before it and never starts one.
+            if c.text.trim().is_empty() {
+                if let Some(line) = lines.last_mut() {
+                    line.text.push_str(&c.text);
+                    line.chars.push((l, r, c.text.clone()));
+                }
+                continue;
+            }
+            let starts_new_line = match lines.last() {
+                Some(line) => b >= line.top || t <= line.bottom,
+                None => true,
+            };
+            if starts_new_line {
+                lines.push(Line {
+                    left: l,
+                    right: r,
+                    bottom: b,
+                    top: t,
+                    text: c.text.clone(),
+                    chars: vec![(l, r, c.text.clone())],
+                });
+            } else {
+                let line = lines.last_mut().expect("just checked non-empty");
+                line.left = line.left.min(l);
+                line.right = line.right.max(r);
+                line.bottom = line.bottom.min(b);
+                line.top = line.top.max(t);
+                line.text.push_str(&c.text);
+                line.chars.push((l, r, c.text.clone()));
+            }
         }
+        lines
+    };
+
+    let hit: Vec<&Ch> = chars.iter().filter(|c| overlaps(&c.ink)).collect();
+    let seed = group(&hit);
+    if seed.is_empty() {
+        return Ok(seed);
     }
-    Ok(lines)
+    let in_a_line = |c: &Ch| {
+        c.ink.0 < right
+            && c.ink.2 > left
+            && seed
+                .iter()
+                .any(|l| c.centre_y >= l.bottom && c.centre_y <= l.top)
+    };
+    let members: Vec<&Ch> = chars
+        .iter()
+        .filter(|c| overlaps(&c.ink) || in_a_line(c))
+        .collect();
+    Ok(group(&members))
 }
 
 /// Drops every character in `line` outside `[min_x, max_x)` (either bound optional, meaning
@@ -414,19 +544,13 @@ fn trim_line(line: &mut Line, min_x: Option<f32>, max_x: Option<f32>) {
     line.text = line.chars.iter().map(|(_, _, c)| c.as_str()).collect();
 }
 
-fn lines_to_selection(lines: &[Line]) -> TextSelection {
+fn lines_to_selection(frame: &Frame, lines: &[Line]) -> TextSelection {
     let quads = lines
         .iter()
         .map(|line| {
+            let (l, b, r, t) = frame.page_rect(line.left, line.bottom, line.right, line.top);
             [
-                line.left as f64,
-                line.top as f64,
-                line.right as f64,
-                line.top as f64,
-                line.left as f64,
-                line.bottom as f64,
-                line.right as f64,
-                line.bottom as f64,
+                l as f64, t as f64, r as f64, t as f64, l as f64, b as f64, r as f64, b as f64,
             ]
         })
         .collect();
@@ -450,11 +574,15 @@ pub fn select_text_in_rect(
     right: f32,
     top: f32,
 ) -> Result<Option<TextSelection>> {
-    let lines = gather_lines(pdfium, bytes, index, left, bottom, right, top)?;
+    let document = pdfium.load_pdf_from_byte_slice(bytes, None)?;
+    let page = document.pages().get(index)?;
+    let frame = Frame::of(&page);
+    let (l, b, r, t) = frame.display_rect(left, bottom, right, top);
+    let lines = gather_lines(&frame, &page, l, b, r, t)?;
     if lines.is_empty() {
         return Ok(None);
     }
-    Ok(Some(lines_to_selection(&lines)))
+    Ok(Some(lines_to_selection(&frame, &lines)))
 }
 
 /// Find the text a drag from `(start_x, start_y)` to `(end_x, end_y)` (PDF points) covers on
@@ -464,10 +592,11 @@ pub fn select_text_in_rect(
 /// under the pointer, and only the first and last lines are trimmed to the actual start/end
 /// x position. `None` if the drag covers no text.
 ///
-/// PDF y is bottom-up, so "top" (reading-order start) is whichever endpoint has the larger
-/// y — direction-agnostic, a drag can run in either direction. A single-line drag has no
-/// "middle" to leave untrimmed, so it degenerates to the same rectangle behaviour as
-/// `select_text_in_rect`.
+/// Lines are worked out on the page as displayed, so a page carrying `/Rotate` selects the
+/// line the reader sees. The first endpoint in reading order is whichever is higher on the
+/// displayed page — direction-agnostic, a drag can run in either direction. A single-line
+/// drag has no "middle" to leave untrimmed, so it degenerates to the same rectangle
+/// behaviour as `select_text_in_rect`.
 pub fn select_text_range(
     pdfium: &Pdfium,
     bytes: &[u8],
@@ -477,6 +606,11 @@ pub fn select_text_range(
     end_x: f32,
     end_y: f32,
 ) -> Result<Option<TextSelection>> {
+    let document = pdfium.load_pdf_from_byte_slice(bytes, None)?;
+    let page = document.pages().get(index)?;
+    let frame = Frame::of(&page);
+    let (start_x, start_y) = frame.display_point(start_x, start_y);
+    let (end_x, end_y) = frame.display_point(end_x, end_y);
     let ((top_x, top_y), (bottom_x, bottom_y)) = if start_y >= end_y {
         ((start_x, start_y), (end_x, end_y))
     } else {
@@ -486,7 +620,7 @@ pub fn select_text_range(
     // Wider than any real PDF page (in points), so the initial gather is unconstrained
     // horizontally — trimming to the actual click x happens after, only on the end lines.
     const WIDE: f32 = 100_000.0;
-    let mut lines = gather_lines(pdfium, bytes, index, -WIDE, bottom_y, WIDE, top_y)?;
+    let mut lines = gather_lines(&frame, &page, -WIDE, bottom_y, WIDE, top_y)?;
     if lines.is_empty() {
         return Ok(None);
     }
@@ -503,7 +637,7 @@ pub fn select_text_range(
     if lines.is_empty() {
         return Ok(None);
     }
-    Ok(Some(lines_to_selection(&lines)))
+    Ok(Some(lines_to_selection(&frame, &lines)))
 }
 
 /// Blend semi-transparent highlight rectangles into an already-rendered page's pixels, given

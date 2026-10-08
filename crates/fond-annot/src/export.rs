@@ -72,7 +72,7 @@ impl Item {
             AnnotationKind::Underline => Some("underlined"),
             AnnotationKind::Strikeout => Some("struck out"),
             AnnotationKind::Note => Some("note"),
-            AnnotationKind::Highlight => None,
+            AnnotationKind::Highlight | AnnotationKind::Unknown => None,
         }
     }
 }

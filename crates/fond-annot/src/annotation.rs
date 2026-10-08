@@ -26,56 +26,165 @@ use crate::util::today_iso;
 /// Current sidecar schema version. Bumped only on a breaking format change.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// What an annotation is. Non-exhaustive: a newer app may write kinds this version has never
+/// heard of, and they must survive a load/save through an older one. Such a kind reads as
+/// [`AnnotationKind::Unknown`] and its original name is kept (see [`Annotation::extra`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum AnnotationKind {
     Highlight,
     Underline,
     Strikeout,
     /// A freestanding marginal note not tied to highlighted text.
     Note,
+    /// A kind written by a newer version of the format.
+    #[serde(other)]
+    Unknown,
 }
+
+/// JSON fields this version doesn't know about, kept verbatim so a save never drops them.
+pub type Extra = serde_json::Map<String, serde_json::Value>;
 
 /// A single annotation. For a PDF, `quadpoints` is the primary anchor when the PDF matches
 /// `AnnotationSidecar::pdf_hash`, with `snippet` (plus prefix/suffix context) as the
 /// re-anchor key when it does not. For an EPUB (no `quadpoints`, no fixed page grid),
 /// `chapter` + `snippet` (+ context) is the only anchor there is.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "AnnotationWire", into = "AnnotationWire")]
 pub struct Annotation {
     /// App-generated stable id (ULID-style), so an annotation survives edits.
     pub id: String,
     pub kind: AnnotationKind,
     /// PDF page the annotation is on (1-based). `None` for an EPUB annotation, which
     /// anchors on `chapter` instead.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page: Option<u32>,
     /// EPUB chapter the annotation is in, as the zip-internal path
     /// (`fond_doc::EpubBook::spine`'s own path shape, e.g. `OEBPS/chap1.xhtml`). `None` for
     /// a PDF annotation, which anchors on `page` + `quadpoints` instead.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chapter: Option<String>,
     /// PDF highlight quads: arrays of 8 floats per rectangle, in PDF user space. Always empty
     /// for an EPUB annotation.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub quadpoints: Vec<[f64; 8]>,
     /// The highlighted text — the fine re-anchoring key.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
     /// A short window of text before the snippet, for disambiguation on re-anchor.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snippet_prefix: Option<String>,
     /// A short window of text after the snippet.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snippet_suffix: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
     /// The user's marginal comment on this annotation, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified: Option<String>,
+    /// Fields this version doesn't know, kept so a save doesn't drop them. For an annotation of
+    /// an unrecognised kind ([`AnnotationKind::Unknown`]) the original kind string is held here
+    /// under `"kind"` and written back as the kind.
+    pub extra: Extra,
+}
+
+/// The on-disk shape of an [`Annotation`]: the kind as a plain string, so one this version
+/// doesn't know can still be read and written back, and unknown fields collected in `extra`.
+#[derive(Serialize, Deserialize)]
+struct AnnotationWire {
+    /// App-generated stable id (ULID-style), so an annotation survives edits.
+    id: String,
+    kind: String,
+    /// PDF page the annotation is on (1-based). `None` for an EPUB annotation, which
+    /// anchors on `chapter` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    page: Option<u32>,
+    /// EPUB chapter the annotation is in, as the zip-internal path
+    /// (`fond_doc::EpubBook::spine`'s own path shape, e.g. `OEBPS/chap1.xhtml`). `None` for
+    /// a PDF annotation, which anchors on `page` + `quadpoints` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chapter: Option<String>,
+    /// PDF highlight quads: arrays of 8 floats per rectangle, in PDF user space. Always empty
+    /// for an EPUB annotation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    quadpoints: Vec<[f64; 8]>,
+    /// The highlighted text — the fine re-anchoring key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snippet: Option<String>,
+    /// A short window of text before the snippet, for disambiguation on re-anchor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snippet_prefix: Option<String>,
+    /// A short window of text after the snippet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snippet_suffix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    color: Option<String>,
+    /// The user's marginal comment on this annotation, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    modified: Option<String>,
+    #[serde(flatten)]
+    extra: Extra,
+}
+
+impl From<AnnotationWire> for Annotation {
+    fn from(w: AnnotationWire) -> Annotation {
+        let mut extra = w.extra;
+        let kind = match w.kind.as_str() {
+            "highlight" => AnnotationKind::Highlight,
+            "underline" => AnnotationKind::Underline,
+            "strikeout" => AnnotationKind::Strikeout,
+            "note" => AnnotationKind::Note,
+            _ => {
+                extra.insert("kind".to_string(), serde_json::Value::String(w.kind));
+                AnnotationKind::Unknown
+            }
+        };
+        Annotation {
+            id: w.id,
+            kind,
+            page: w.page,
+            chapter: w.chapter,
+            quadpoints: w.quadpoints,
+            snippet: w.snippet,
+            snippet_prefix: w.snippet_prefix,
+            snippet_suffix: w.snippet_suffix,
+            color: w.color,
+            note: w.note,
+            created: w.created,
+            modified: w.modified,
+            extra,
+        }
+    }
+}
+
+impl From<Annotation> for AnnotationWire {
+    fn from(a: Annotation) -> AnnotationWire {
+        let mut extra = a.extra;
+        let kind = match a.kind {
+            AnnotationKind::Highlight => "highlight".to_string(),
+            AnnotationKind::Underline => "underline".to_string(),
+            AnnotationKind::Strikeout => "strikeout".to_string(),
+            AnnotationKind::Note => "note".to_string(),
+            AnnotationKind::Unknown => match extra.remove("kind") {
+                Some(serde_json::Value::String(raw)) => raw,
+                _ => "unknown".to_string(),
+            },
+        };
+        AnnotationWire {
+            id: a.id,
+            kind,
+            page: a.page,
+            chapter: a.chapter,
+            quadpoints: a.quadpoints,
+            snippet: a.snippet,
+            snippet_prefix: a.snippet_prefix,
+            snippet_suffix: a.snippet_suffix,
+            color: a.color,
+            note: a.note,
+            created: a.created,
+            modified: a.modified,
+            extra,
+        }
+    }
 }
 
 /// The full sidecar for one entry's PDF.
@@ -90,6 +199,9 @@ pub struct AnnotationSidecar {
     pub pdf_hash: Option<String>,
     #[serde(default)]
     pub annotations: Vec<Annotation>,
+    /// Top-level fields this version doesn't know, kept so a save doesn't drop them.
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 impl Annotation {
@@ -122,6 +234,7 @@ impl Annotation {
             note: contents,
             created: None,
             modified: None,
+            extra: Extra::new(),
         }
     }
 
@@ -160,6 +273,7 @@ impl Annotation {
             note,
             created: Some(stamp.clone()),
             modified: Some(stamp),
+            extra: Extra::new(),
         }
     }
 
@@ -196,6 +310,7 @@ impl Annotation {
             note,
             created: Some(stamp.clone()),
             modified: Some(stamp),
+            extra: Extra::new(),
         }
     }
 }
@@ -208,6 +323,7 @@ impl AnnotationSidecar {
             key: key.into(),
             pdf_hash: None,
             annotations: Vec::new(),
+            extra: Extra::new(),
         }
     }
 
@@ -380,10 +496,12 @@ mod tests {
 
     fn sample() -> AnnotationSidecar {
         AnnotationSidecar {
+            extra: Default::default(),
             schema: 1,
             key: "cone1970black".into(),
             pdf_hash: Some("blake3:9f2bc4".into()),
             annotations: vec![Annotation {
+                extra: Default::default(),
                 id: "01J8Z000".into(),
                 kind: AnnotationKind::Highlight,
                 page: Some(7),
@@ -431,6 +549,7 @@ mod tests {
             note: Some("just a margin note".into()),
             created: None,
             modified: None,
+            extra: Extra::new(),
         });
         let json = sidecar.to_json().unwrap();
         assert!(!json.contains("quadpoints"));
@@ -457,6 +576,7 @@ mod tests {
             note: None,
             created: None,
             modified: None,
+            extra: Extra::new(),
         };
         let json = serde_json::to_string(&pdf).unwrap();
         assert!(json.contains("\"page\":3"));
@@ -524,6 +644,7 @@ mod tests {
             note: Some("just a margin note".into()),
             created: None,
             modified: None,
+            extra: Extra::new(),
         });
         let md = sidecar.to_markdown("Untitled", None);
         assert_eq!(md, "# Untitled\n\n## Page 2 — Note\n\njust a margin note\n");
@@ -586,6 +707,7 @@ mod tests {
             None,
         );
         AnnotationSidecar {
+            extra: Default::default(),
             schema: SCHEMA_VERSION,
             key: "cone1970black".to_string(),
             pdf_hash: None,
@@ -616,6 +738,7 @@ mod tests {
     #[test]
     fn typst_export_of_nothing_is_empty_and_epub_notes_have_no_page() {
         let empty = AnnotationSidecar {
+            extra: Default::default(),
             schema: SCHEMA_VERSION,
             key: "k".to_string(),
             pdf_hash: None,
@@ -634,6 +757,7 @@ mod tests {
         e.page = None;
         e.chapter = Some("OEBPS/ch1.xhtml".into());
         let sidecar = AnnotationSidecar {
+            extra: Default::default(),
             schema: SCHEMA_VERSION,
             key: "k".to_string(),
             pdf_hash: None,
@@ -656,6 +780,7 @@ mod tests {
             None,
         );
         let sidecar = AnnotationSidecar {
+            extra: Default::default(),
             schema: SCHEMA_VERSION,
             key: "k".to_string(),
             pdf_hash: None,
@@ -666,5 +791,67 @@ mod tests {
             typ.contains("[costs \\#5 \\[see \\$x\\$\\] \\_now\\_]"),
             "{typ}"
         );
+    }
+
+    const FUTURE: &str = r#"{
+      "schema": 2,
+      "key": "k",
+      "future-top-level": {"a": 1},
+      "annotations": [
+        {"id": "a1", "kind": "highlight", "page": 3, "snippet": "kept", "tags": ["x", "y"]},
+        {"id": "a2", "kind": "area", "page": 4, "rect": [1.0, 2.0, 3.0, 4.0], "note": "a figure"}
+      ]
+    }"#;
+
+    #[test]
+    fn a_sidecar_with_a_kind_from_the_future_still_loads() {
+        let sidecar = AnnotationSidecar::parse(FUTURE, Path::new("x.json")).unwrap();
+        assert_eq!(sidecar.annotations.len(), 2);
+        assert_eq!(sidecar.annotations[0].kind, AnnotationKind::Highlight);
+        assert_eq!(sidecar.annotations[1].kind, AnnotationKind::Unknown);
+        assert_eq!(sidecar.annotations[1].note.as_deref(), Some("a figure"));
+    }
+
+    #[test]
+    fn unknown_kinds_and_fields_survive_a_load_and_save() {
+        let sidecar = AnnotationSidecar::parse(FUTURE, Path::new("x.json")).unwrap();
+        let again: serde_json::Value = serde_json::from_str(&sidecar.to_json().unwrap()).unwrap();
+        let original: serde_json::Value = serde_json::from_str(FUTURE).unwrap();
+        assert_eq!(again, original);
+    }
+
+    #[test]
+    fn an_older_writer_editing_a_known_annotation_keeps_its_unknown_fields() {
+        let mut sidecar = AnnotationSidecar::parse(FUTURE, Path::new("x.json")).unwrap();
+        sidecar.annotations[0].note = Some("edited".to_string());
+        let json: serde_json::Value = serde_json::from_str(&sidecar.to_json().unwrap()).unwrap();
+        assert_eq!(
+            json["annotations"][0]["tags"],
+            serde_json::json!(["x", "y"])
+        );
+        assert_eq!(json["annotations"][0]["note"], "edited");
+        assert_eq!(json["annotations"][1]["kind"], "area");
+    }
+
+    #[test]
+    fn a_known_annotation_writes_no_extra_keys() {
+        let mut sidecar = AnnotationSidecar::new("k");
+        sidecar.annotations.push(Annotation::drawn(
+            AnnotationKind::Highlight,
+            1,
+            vec![],
+            None,
+            None,
+            None,
+        ));
+        let json: serde_json::Value = serde_json::from_str(&sidecar.to_json().unwrap()).unwrap();
+        let keys: Vec<&String> = json["annotations"][0].as_object().unwrap().keys().collect();
+        for k in keys {
+            assert!(
+                ["id", "kind", "page", "color", "created", "modified"].contains(&k.as_str()),
+                "unexpected key {k}"
+            );
+        }
+        assert_eq!(json.as_object().unwrap().len(), 3);
     }
 }
