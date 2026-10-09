@@ -40,6 +40,9 @@ pub struct Item {
     pub color: Option<String>,
     pub quote: Option<String>,
     pub note: Option<String>,
+    /// A picture of the item (a clipped area), as a path the output document can load: it is
+    /// written into the export as a figure. Without one an area is exported as its text.
+    pub image: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,7 +75,7 @@ impl Item {
             AnnotationKind::Underline => Some("underlined"),
             AnnotationKind::Strikeout => Some("struck out"),
             AnnotationKind::Note => Some("note"),
-            AnnotationKind::Highlight | AnnotationKind::Unknown => None,
+            AnnotationKind::Highlight | AnnotationKind::Area | AnnotationKind::Unknown => None,
         }
     }
 }
@@ -130,7 +133,21 @@ fn markdown(title: &str, items: &[Item], bookmarks: &[String], opts: &Options) -
             None => {}
         }
         for it in group {
-            if let Some(q) = it.quote.as_deref().filter(|q| !q.trim().is_empty()) {
+            if let Some(image) = &it.image {
+                let cite = match &opts.cite_key {
+                    Some(k) => format!("[@{k}, {}]", it.locator_text()),
+                    None => format!("({})", it.locator_text()),
+                };
+                out.push_str(&format!(
+                    "![{}]({})\n\n{cite}\n\n",
+                    it.quote
+                        .as_deref()
+                        .unwrap_or("")
+                        .replace(['[', ']', '\n'], " ")
+                        .trim(),
+                    image.replace(' ', "%20")
+                ));
+            } else if let Some(q) = it.quote.as_deref().filter(|q| !q.trim().is_empty()) {
                 for line in q.lines() {
                     out.push_str(&format!("> {line}\n"));
                 }
@@ -202,6 +219,11 @@ fn typst_escape_line(line: &str) -> String {
     out
 }
 
+/// Escape text for the inside of a Typst string literal.
+fn typst_string(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 fn typst_paragraphs(s: &str) -> String {
     s.split("\n\n")
         .map(|p| typst_escape(p.trim()))
@@ -238,7 +260,16 @@ fn typst(title: &str, items: &[Item], bookmarks: &[String], opts: &Options) -> S
                 .kind_tag()
                 .map(|t| format!(" _({t})_"))
                 .unwrap_or_default();
-            if let Some(q) = it.quote.as_deref().filter(|q| !q.trim().is_empty()) {
+            if let Some(image) = &it.image {
+                let mut caption = attribution.clone();
+                if let Some(q) = it.quote.as_deref().filter(|q| !q.trim().is_empty()) {
+                    caption = format!("{}, {attribution}", typst_escape(q.trim()));
+                }
+                out.push_str(&format!(
+                    "#figure(image(\"{}\"), caption: [{caption}])\n\n",
+                    typst_string(image)
+                ));
+            } else if let Some(q) = it.quote.as_deref().filter(|q| !q.trim().is_empty()) {
                 out.push_str(&format!(
                     "#quote(block: true, attribution: [{attribution}{tag}])[{}]\n\n",
                     typst_paragraphs(q)
@@ -303,7 +334,11 @@ fn latex(title: &str, items: &[Item], bookmarks: &[String], opts: &Options) -> S
                 .kind_tag()
                 .map(|t| format!(" \\emph{{({t})}}"))
                 .unwrap_or_default();
-            if let Some(q) = it.quote.as_deref().filter(|q| !q.trim().is_empty()) {
+            if let Some(image) = &it.image {
+                out.push_str(&format!(
+                    "\\begin{{figure}}[h]\n\\centering\n\\includegraphics[width=\\linewidth]{{{image}}}\n\\caption{{{cite}}}\n\\end{{figure}}\n\n"
+                ));
+            } else if let Some(q) = it.quote.as_deref().filter(|q| !q.trim().is_empty()) {
                 out.push_str(&format!(
                     "\\begin{{quote}}\n{}\n{cite}{tag}\n\\end{{quote}}\n\n",
                     latex_escape(q.trim())
@@ -329,6 +364,17 @@ pub fn items_from_sidecar(
     sidecar: &AnnotationSidecar,
     page_labels: &[Option<String>],
     chapter_number: &dyn Fn(&str) -> Option<usize>,
+) -> Vec<Item> {
+    items_with_images(sidecar, page_labels, chapter_number, &|_| None)
+}
+
+/// As [`items_from_sidecar`], with `image_for` supplying the picture of each clipped area (by
+/// annotation id), if there is one.
+pub fn items_with_images(
+    sidecar: &AnnotationSidecar,
+    page_labels: &[Option<String>],
+    chapter_number: &dyn Fn(&str) -> Option<usize>,
+    image_for: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<Item> {
     type SortKey = (u8, usize, Option<String>);
     let mut keyed: Vec<(SortKey, Item)> = sidecar
@@ -364,6 +410,9 @@ pub fn items_from_sidecar(
                     color: a.color.clone(),
                     quote: a.snippet.clone(),
                     note: a.note.clone(),
+                    image: (a.kind == AnnotationKind::Area)
+                        .then(|| image_for(&a.id))
+                        .flatten(),
                 },
             )
         })
@@ -387,6 +436,7 @@ pub fn cite_snippet(
         color: None,
         quote: None,
         note: None,
+        image: None,
     };
     let quote = quote.split_whitespace().collect::<Vec<_>>().join(" ");
     match (format, cite_key) {
@@ -430,6 +480,7 @@ mod tests {
             color: Some(color.into()),
             quote: Some(quote.into()),
             note: note.map(str::to_string),
+            image: None,
         }
     }
 
@@ -567,5 +618,43 @@ mod tests {
                 std::fs::write(format!("{dir}/{name}.{ext}"), out).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn a_clipped_area_is_a_figure_in_each_format() {
+        let it = Item {
+            kind: AnnotationKind::Area,
+            image: Some("figs/a \"b\".png".into()),
+            ..item("7", "#D6B86A", "Fig. 2 [raw]", Some("note"))
+        };
+        let typ = render(
+            "T",
+            std::slice::from_ref(&it),
+            &[],
+            &opts(Format::Typst, false, Some("k")),
+        );
+        assert!(
+            typ.contains(r#"#figure(image("figs/a \"b\".png"), caption: [Fig. 2 \[raw\], "#),
+            "{typ}"
+        );
+        let md = render(
+            "T",
+            std::slice::from_ref(&it),
+            &[],
+            &opts(Format::Markdown, false, None),
+        );
+        assert!(md.contains("![Fig. 2  raw](figs/a%20\"b\".png)"), "{md}");
+        let tex = render("T", &[it], &[], &opts(Format::Latex, false, None));
+        assert!(
+            tex.contains("\\includegraphics[width=\\linewidth]{figs/a \"b\".png}"),
+            "{tex}"
+        );
+        let no_image = Item {
+            kind: AnnotationKind::Area,
+            ..item("7", "#D6B86A", "text only", None)
+        };
+        assert!(
+            render("T", &[no_image], &[], &opts(Format::Typst, false, None)).contains("#quote")
+        );
     }
 }
