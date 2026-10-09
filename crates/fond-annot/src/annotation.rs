@@ -38,6 +38,9 @@ pub enum AnnotationKind {
     Strikeout,
     /// A freestanding marginal note not tied to highlighted text.
     Note,
+    /// A rectangle clipped from the page — a figure, table or equation — kept as `rect`
+    /// ([`Annotation::rect`]); `snippet` holds its text when the page has a text layer there.
+    Area,
     /// A kind written by a newer version of the format.
     #[serde(other)]
     Unknown,
@@ -133,6 +136,7 @@ impl From<AnnotationWire> for Annotation {
             "underline" => AnnotationKind::Underline,
             "strikeout" => AnnotationKind::Strikeout,
             "note" => AnnotationKind::Note,
+            "area" => AnnotationKind::Area,
             _ => {
                 extra.insert("kind".to_string(), serde_json::Value::String(w.kind));
                 AnnotationKind::Unknown
@@ -164,6 +168,7 @@ impl From<Annotation> for AnnotationWire {
             AnnotationKind::Underline => "underline".to_string(),
             AnnotationKind::Strikeout => "strikeout".to_string(),
             AnnotationKind::Note => "note".to_string(),
+            AnnotationKind::Area => "area".to_string(),
             AnnotationKind::Unknown => match extra.remove("kind") {
                 Some(serde_json::Value::String(raw)) => raw,
                 _ => "unknown".to_string(),
@@ -204,7 +209,122 @@ pub struct AnnotationSidecar {
     pub extra: Extra,
 }
 
+/// The `#tags` typed in a note, lower-cased and without the `#`, in order of appearance and
+/// without repeats. A tag is a `#` that starts a word, followed by letters, digits, `-` or `_`
+/// (so `#3` in "see #3" counts, and the `#` inside "C#" does not).
+pub fn parse_note_tags(note: &str) -> Vec<String> {
+    let mut tags: Vec<String> = Vec::new();
+    let mut previous: Option<char> = None;
+    let mut chars = note.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '#' && previous.map_or(true, |p| p.is_whitespace() || "([{\"'".contains(p)) {
+            let mut tag = String::new();
+            while let Some(&n) = chars.peek() {
+                if n.is_alphanumeric() || n == '-' || n == '_' {
+                    tag.extend(n.to_lowercase());
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if !tag.is_empty() && !tags.contains(&tag) {
+                tags.push(tag);
+            }
+            previous = Some('x');
+            continue;
+        }
+        previous = Some(c);
+    }
+    tags
+}
+
+/// Keys kept in [`Annotation::extra`], so a version of the format that predates them keeps them
+/// through a save.
+const RECT_KEY: &str = "rect";
+const TAGS_KEY: &str = "tags";
+const POSITION_KEY: &str = "position";
+
 impl Annotation {
+    /// For an [`AnnotationKind::Area`]: the clipped rectangle `[left, bottom, right, top]` in PDF
+    /// user space.
+    pub fn rect(&self) -> Option<[f64; 4]> {
+        let v = self.extra.get(RECT_KEY)?.as_array()?;
+        let n: Vec<f64> = v.iter().filter_map(|x| x.as_f64()).collect();
+        (n.len() == 4).then(|| [n[0], n[1], n[2], n[3]])
+    }
+
+    pub fn set_rect(&mut self, rect: Option<[f64; 4]>) {
+        match rect {
+            Some(r) => self.extra.insert(RECT_KEY.into(), serde_json::json!(r)),
+            None => self.extra.remove(RECT_KEY),
+        };
+    }
+
+    /// Where a freestanding note's icon sits on its page: `[x, y]` in PDF user space.
+    pub fn position(&self) -> Option<[f64; 2]> {
+        let v = self.extra.get(POSITION_KEY)?.as_array()?;
+        let n: Vec<f64> = v.iter().filter_map(|x| x.as_f64()).collect();
+        (n.len() == 2).then(|| [n[0], n[1]])
+    }
+
+    pub fn set_position(&mut self, position: Option<[f64; 2]>) {
+        match position {
+            Some(p) => self.extra.insert(POSITION_KEY.into(), serde_json::json!(p)),
+            None => self.extra.remove(POSITION_KEY),
+        };
+    }
+
+    /// The tags set on this annotation itself, without those typed into its note.
+    pub fn explicit_tags(&self) -> Vec<String> {
+        self.extra
+            .get(TAGS_KEY)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| t.as_str().map(str::to_lowercase))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Every tag of the annotation: those set on it, then those typed as `#tag` in its note,
+    /// without repeats. Either way of tagging works.
+    pub fn tags(&self) -> Vec<String> {
+        let mut all = self.explicit_tags();
+        for t in self
+            .note
+            .as_deref()
+            .map(parse_note_tags)
+            .unwrap_or_default()
+        {
+            if !all.contains(&t) {
+                all.push(t);
+            }
+        }
+        all
+    }
+
+    pub fn set_explicit_tags(&mut self, tags: &[String]) {
+        if tags.is_empty() {
+            self.extra.remove(TAGS_KEY);
+        } else {
+            self.extra.insert(TAGS_KEY.into(), serde_json::json!(tags));
+        }
+    }
+
+    /// A new clipped area: `rect` as in [`Annotation::rect`], `snippet` the text found inside it.
+    pub fn area(
+        page: u32,
+        rect: [f64; 4],
+        snippet: Option<String>,
+        note: Option<String>,
+        color: Option<String>,
+    ) -> Annotation {
+        let mut a = Annotation::drawn(AnnotationKind::Area, page, Vec::new(), snippet, note, color);
+        a.set_rect(Some(rect));
+        a
+    }
+
     /// Build an annotation imported from an embedded PDF annotation, with a deterministic
     /// id derived from its kind/page/text so re-importing the same highlight is idempotent
     /// (and re-anchoring by snippet still works across differently-produced PDFs).
@@ -799,7 +919,7 @@ mod tests {
       "future-top-level": {"a": 1},
       "annotations": [
         {"id": "a1", "kind": "highlight", "page": 3, "snippet": "kept", "tags": ["x", "y"]},
-        {"id": "a2", "kind": "area", "page": 4, "rect": [1.0, 2.0, 3.0, 4.0], "note": "a figure"}
+        {"id": "a2", "kind": "sketch", "page": 4, "rect": [1.0, 2.0, 3.0, 4.0], "note": "a figure"}
       ]
     }"#;
 
@@ -830,7 +950,7 @@ mod tests {
             serde_json::json!(["x", "y"])
         );
         assert_eq!(json["annotations"][0]["note"], "edited");
-        assert_eq!(json["annotations"][1]["kind"], "area");
+        assert_eq!(json["annotations"][1]["kind"], "sketch");
     }
 
     #[test]
@@ -853,5 +973,53 @@ mod tests {
             );
         }
         assert_eq!(json.as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn tags_come_from_the_note_and_from_the_field_alike() {
+        assert_eq!(
+            parse_note_tags("on #Method and (#method) but not C# or a#b; see #3, #long-term_view"),
+            ["method", "3", "long-term_view"]
+        );
+        let mut a = Annotation::drawn(
+            AnnotationKind::Highlight,
+            1,
+            vec![],
+            None,
+            Some("good #x".into()),
+            None,
+        );
+        a.set_explicit_tags(&["Y".to_string(), "x".to_string()]);
+        assert_eq!(a.tags(), ["y", "x"]);
+        assert_eq!(a.explicit_tags(), ["y", "x"]);
+    }
+
+    #[test]
+    fn an_area_keeps_its_rect_and_a_note_its_position_through_json() {
+        let mut a = Annotation::area(
+            3,
+            [10.0, 20.0, 110.5, 220.0],
+            Some("E = mc2".into()),
+            None,
+            None,
+        );
+        a.set_position(Some([5.0, 6.0]));
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(json.contains("\"kind\":\"area\""), "{json}");
+        let back: Annotation = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.kind, AnnotationKind::Area);
+        assert_eq!(back.rect(), Some([10.0, 20.0, 110.5, 220.0]));
+        assert_eq!(back.position(), Some([5.0, 6.0]));
+    }
+
+    #[test]
+    fn an_area_written_by_hand_reads_back() {
+        let json = r#"{"id":"a1","kind":"area","page":2,"rect":[1,2,3,4],"tags":["fig"]}"#;
+        let a: Annotation = serde_json::from_str(json).unwrap();
+        assert_eq!(a.rect(), Some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(a.tags(), ["fig"]);
+        let mut a = a;
+        a.set_rect(None);
+        assert!(a.rect().is_none());
     }
 }
