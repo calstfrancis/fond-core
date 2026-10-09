@@ -43,6 +43,9 @@ pub struct Item {
     /// A picture of the item (a clipped area), as a path the output document can load: it is
     /// written into the export as a figure. Without one an area is exported as its text.
     pub image: Option<String>,
+    /// A link that opens the passage in the reader (`pereplyot://…`), added to the item's
+    /// attribution where the format can carry one (Typst, Markdown).
+    pub link: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +141,7 @@ fn markdown(title: &str, items: &[Item], bookmarks: &[String], opts: &Options) -
                     Some(k) => format!("[@{k}, {}]", it.locator_text()),
                     None => format!("({})", it.locator_text()),
                 };
+                let cite = markdown_with_link(cite, it);
                 out.push_str(&format!(
                     "![{}]({})\n\n{cite}\n\n",
                     it.quote
@@ -155,6 +159,7 @@ fn markdown(title: &str, items: &[Item], bookmarks: &[String], opts: &Options) -
                     Some(k) => format!("[@{k}, {}]", it.locator_text()),
                     None => format!("({})", it.locator_text()),
                 };
+                let cite = markdown_with_link(cite, it);
                 out.push_str(&format!(">\n> — {cite}"));
                 if let Some(tag) = it.kind_tag() {
                     out.push_str(&format!(" *({tag})*"));
@@ -169,6 +174,16 @@ fn markdown(title: &str, items: &[Item], bookmarks: &[String], opts: &Options) -
         }
     }
     out
+}
+
+fn markdown_with_link(cite: String, it: &Item) -> String {
+    match &it.link {
+        Some(link) => format!(
+            "{cite} [↗]({})",
+            link.replace(' ', "%20").replace(')', "%29")
+        ),
+        None => cite,
+    }
 }
 
 // ------------------------------------------------------------------ Typst
@@ -233,9 +248,13 @@ fn typst_paragraphs(s: &str) -> String {
 }
 
 fn typst_attribution(it: &Item, cite_key: &Option<String>) -> String {
-    match cite_key {
+    let base = match cite_key {
         Some(k) => crate::cite::typst_citation(k, Some(&it.locator_text())),
         None => typst_escape(&it.locator_text()),
+    };
+    match &it.link {
+        Some(link) => format!("{base} #link(\"{}\")[↗]", typst_string(link)),
+        None => base,
     }
 }
 
@@ -376,6 +395,17 @@ pub fn items_with_images(
     chapter_number: &dyn Fn(&str) -> Option<usize>,
     image_for: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<Item> {
+    items_with_links(sidecar, page_labels, chapter_number, image_for, &|_| None)
+}
+
+/// As [`items_with_images`], with `link_for` supplying each annotation's deep link (by id).
+pub fn items_with_links(
+    sidecar: &AnnotationSidecar,
+    page_labels: &[Option<String>],
+    chapter_number: &dyn Fn(&str) -> Option<usize>,
+    image_for: &dyn Fn(&str) -> Option<String>,
+    link_for: &dyn Fn(&str) -> Option<String>,
+) -> Vec<Item> {
     type SortKey = (u8, usize, Option<String>);
     let mut keyed: Vec<(SortKey, Item)> = sidecar
         .annotations
@@ -413,6 +443,7 @@ pub fn items_with_images(
                     image: (a.kind == AnnotationKind::Area)
                         .then(|| image_for(&a.id))
                         .flatten(),
+                    link: link_for(&a.id),
                 },
             )
         })
@@ -437,6 +468,7 @@ pub fn cite_snippet(
         quote: None,
         note: None,
         image: None,
+        link: None,
     };
     let quote = quote.split_whitespace().collect::<Vec<_>>().join(" ");
     match (format, cite_key) {
@@ -481,6 +513,7 @@ mod tests {
             quote: Some(quote.into()),
             note: note.map(str::to_string),
             image: None,
+            link: None,
         }
     }
 
@@ -655,6 +688,29 @@ mod tests {
         };
         assert!(
             render("T", &[no_image], &[], &opts(Format::Typst, false, None)).contains("#quote")
+        );
+    }
+
+    #[test]
+    fn a_deep_link_follows_the_attribution_in_typst_and_markdown() {
+        let it = Item {
+            link: Some("pereplyot://open?hash=ab&annotation=h1".into()),
+            ..item("7", "#D6B86A", "quoted", None)
+        };
+        let typ = render(
+            "T",
+            std::slice::from_ref(&it),
+            &[],
+            &opts(Format::Typst, false, Some("k")),
+        );
+        assert!(
+            typ.contains(r#"#link("pereplyot://open?hash=ab&annotation=h1")[↗]"#),
+            "{typ}"
+        );
+        let md = render("T", &[it], &[], &opts(Format::Markdown, false, None));
+        assert!(
+            md.contains("(p. 7) [↗](pereplyot://open?hash=ab&annotation=h1)"),
+            "{md}"
         );
     }
 }
