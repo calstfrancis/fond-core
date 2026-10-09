@@ -16,4 +16,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Fetch PDFium so the real-PDF tests run instead of skipping
+        run: |
+          mkdir -p "$RUNNER_TEMP/pdfium"
+          curl -sSL -o "$RUNNER_TEMP/pdfium.tgz" \
+            "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F7961/pdfium-linux-x64.tgz"
+          echo "019665c8877d46fe65f625f80fd714ab07aac68554b0636acf2a2adf9288adb2  $RUNNER_TEMP/pdfium.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/pdfium.tgz" -C "$RUNNER_TEMP/pdfium"
+          echo "PDFIUM_LIB_PATH=$RUNNER_TEMP/pdfium/lib" >> "$GITHUB_ENV"
       - run: cargo test --workspace

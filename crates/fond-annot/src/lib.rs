@@ -8,6 +8,6 @@ pub mod export;
 pub mod progress;
 pub mod util;
 
-pub use annotation::{Annotation, AnnotationKind, AnnotationSidecar};
+pub use annotation::{Annotation, AnnotationKind, AnnotationSidecar, Extra};
 pub use error::{AnnotError, Result};
 pub use progress::{PageLabelOverride, Progress};
