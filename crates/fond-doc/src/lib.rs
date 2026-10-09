@@ -7,6 +7,7 @@
 pub mod annotation;
 pub mod epub;
 pub mod error;
+pub mod interop;
 pub mod pdf;
 pub mod text_cache;
 
