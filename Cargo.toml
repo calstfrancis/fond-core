@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/fond-doc", "crates/fond-annot"]
+members = ["crates/fond-doc", "crates/fond-annot", "crates/fond-status"]
 
 [workspace.package]
 edition = "2021"
