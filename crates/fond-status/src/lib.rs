@@ -250,6 +250,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 pub mod summary;
+pub mod whats_new;
 
 #[cfg(test)]
 mod tests {
