@@ -249,6 +249,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+pub mod contracts;
 pub mod summary;
 pub mod whats_new;
 
