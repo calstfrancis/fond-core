@@ -20,6 +20,25 @@ pub const SCHEMA: u32 = 1;
 /// How many resume entries a status file keeps, newest first.
 pub const MAX_RESUME: usize = 3;
 
+/// The longest `context` line, in characters.
+pub const MAX_CONTEXT: usize = 120;
+
+/// `text` as one `context` line: whitespace collapsed to single spaces and cut to
+/// [`MAX_CONTEXT`] characters with a trailing "…". `None` when nothing is left.
+pub fn context_line(text: &str) -> Option<String> {
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.is_empty() {
+        return None;
+    }
+    if line.chars().count() <= MAX_CONTEXT {
+        return Some(line);
+    }
+    let mut cut: String = line.chars().take(MAX_CONTEXT - 1).collect();
+    cut.truncate(cut.trim_end().len());
+    cut.push('…');
+    Some(cut)
+}
+
 /// Overrides [`status_dir`]. For tests and headless runs, so they never touch real files.
 pub const DIR_ENV: &str = "FOND_STATUS_DIR";
 
@@ -48,6 +67,10 @@ pub struct ResumeEntry {
     /// When it was last worked on, RFC 3339 with an offset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at: Option<String>,
+    /// One line from the work itself that says where you were: the heading you were under, the
+    /// passage you last marked. At most [`MAX_CONTEXT`] characters; build it with [`context_line`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
     /// Handed back to the app unchanged, as `flatpak run <id> <args…>`. When the entry is a
     /// file, its absolute path is `args[0]`, so a reader can check it still exists.
     #[serde(default)]
@@ -243,6 +266,7 @@ mod tests {
             title: title.to_string(),
             detail: None,
             at: Some("2026-11-09T16:40:00-04:00".to_string()),
+            context: None,
             args: vec![path.to_string()],
         }
     }
@@ -259,6 +283,39 @@ mod tests {
         // No temp file is left behind.
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_context_line_survives_a_round_trip_and_an_old_file_has_none() {
+        let dir = temp_dir("context");
+        let mut status = Status::new("zerkalo", "");
+        let mut e = entry("essay-2.typ", "/tmp/example/essay-2.typ");
+        e.context = Some("§2 Method".to_string());
+        status.push_resume(e);
+        status.write(&dir).unwrap();
+        let read = Status::read(&dir, "zerkalo").unwrap().unwrap();
+        assert_eq!(read.resume[0].context.as_deref(), Some("§2 Method"));
+
+        fs::write(
+            dir.join("pereplyot.json"),
+            r#"{"schema":1,"app":"pereplyot","resume":[{"title":"A","args":["/a.pdf"]}]}"#,
+        )
+        .unwrap();
+        let old = Status::read(&dir, "pereplyot").unwrap().unwrap();
+        assert_eq!(old.resume[0].context, None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_context_line_is_one_short_line() {
+        assert_eq!(context_line("  \n "), None);
+        assert_eq!(
+            context_line("the second\n  argument   fails").as_deref(),
+            Some("the second argument fails")
+        );
+        let long = context_line(&"é".repeat(300)).unwrap();
+        assert_eq!(long.chars().count(), MAX_CONTEXT);
+        assert!(long.ends_with('…'));
     }
 
     #[test]

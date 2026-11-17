@@ -148,6 +148,7 @@ mod tests {
             title: "An Example Course".to_string(),
             detail: None,
             at: None,
+            context: None,
             args: vec!["--example".to_string()],
         });
         before.write(&dir).unwrap();
